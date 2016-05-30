@@ -1,0 +1,185 @@
+---
+title: "Predicting Quality of Excercise"
+output: html_document
+---
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data 
+about personal activity relatively inexpensively. These type of devices are part of the quantified self
+movement – a group of enthusiasts who take measurements about themselves regularly to improve their health,
+to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is 
+quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this 
+project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 
+participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
+More information is available from the website here: http://groupware.les.inf.puc-rio.br/har 
+(see the section on the Weight Lifting Exercise Dataset).
+
+Data
+
+The training data for this project are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har. 
+If you use the document you create for this class for any purpose please cite them as they have been 
+very generous in allowing their data to be used for this kind of assignment.
+
+Overview
+	-> I  will build 5 different models
+	-> Then use ensembling to predict the testset  
+
+First Load Packages
+```{r}
+load("~/coursera/Practical Machine Learning/PracticalMachineLearning.rdata")
+library(caret)
+library(xgboost)
+library(Matrix)
+```
+Begin with importing and cleaning data
+```{r eval=FALSE}
+
+training <- read.csv(file = "C:\\Users\\hgongor\\Documents\\coursera\\Practical Machine Learning\\pml-training.csv" )
+testing <- read.csv(file = "C:\\Users\\hgongor\\Documents\\coursera\\Practical Machine Learning\\pml-testing.csv" )
+
+# check to see what fields have more than 95% missing values
+y <- 0
+for( i in 1:length(training)){
+  y[i] <- sum(is.na(training[,i])|(training[,i])=="")>.95*nrow(training)
+}
+
+sum(y) 
+# looks like 100 fields have more than 95% of missing data
+y <- as.logical(y)
+names(training)[y] 
+# these fields are missing a lot of data
+# we'll ignore these fields
+training<- training[,!y]
+summary(training)
+testing <- testing[,!y]
+#  need to clean data more 
+training <- training[, -1] # remove X field
+testing <- testing[, -1]
+```
+We will now break our training data set into two subsets. One which will be used for training (75% of data)  
+The other 25% will be used for testing, since we want to be able to determine how well the models are performing.
+```{r eval=FALSE}
+set.seed(1000)
+inTrain = createDataPartition(training$classe, p = 3 / 4)[[1]]
+subtraining = training[inTrain,]
+subtesting = training[ - inTrain,]
+```
+Next, we will build a gbm model using a cross validation using a 5 fold. 
+We will define our tuning parameters
+```{r eval=FALSE}
+fitControl <- trainControl(## 5-fold CV
+        method = "repeatedcv",
+        number = 5,
+        ## repeated one times
+        repeats = 1)
+
+gbmGrid <- expand.grid(interaction.depth = c(5,9,12),
+                        n.trees = (9:12)*50,
+                        shrinkage = 0.1,
+                        n.minobsinnode= 10)
+
+```
+We will build two gbm models, one of the models will have a pre-process using principle components method and the  other will not
+```{r eval=FALSE}
+set.seed(3432)
+model1 <- train(classe ~ ., method = "gbm", data = subtraining, trControl = fitControl, tuneGrid = gbmGrid)
+model2 <- train(classe ~ ., method = "gbm", data = subtraining, preProcess = "pca", trControl = fitControl, tuneGrid = gbmGrid)
+
+```
+Next we create two models using method "rpart".
+One model will use principle components as a pre-process the other will not. Again, we will use a 5-fold crossfold validation.
+```{r eval=FALSE}
+rpcontrol <- trainControl(method = "cv", number = 5)
+set.seed(2113)
+model3 <- train(classe ~ ., method = "rpart", data = subtraining, trControl = rpcontrol)
+model4 <- train(classe~. ,method = "rpart", data = subtraining, trControl = rpcontrol, preProcess = "pca")
+
+```
+The next model will use the extreme gradient boosting. I want try this method since it includes the regularized term which can help regulate model complexity. 
+We'll use 5-fold crossfold validation to determine the optimal number of rounds to perform.
+But first we need to create a sparse matrix which is required format when using "xgboost".
+
+```{r eval=FALSE}
+param <- list("objective" = "multi:softmax",
+                "num_class" = 5,
+               "bst:max_depth" = 20,
+               "eval_metric" = "merror",
+               "silent" = 0,
+               "gamma" = .001
+                )
+sparse_matrix = sparse.model.matrix(classe ~ . - 1, data = subtraining)
+output_vector = as.numeric(as.factor(subtraining$classe))-1 #xgboost starts factors at 0
+dtrain = xgb.DMatrix(data = sparse_matrix, label = output_vector)
+set.seed(334)
+model5cv <- xgb.cv(params = param, data = dtrain, nrounds = 100, nfold = 5, prediction = TRUE)
+model5cv[1]$dt
+bestround = which.min(as.matrix(model5cv[1]$dt)[,3] + as.matrix(model5cv[1]$dt)[, 4])
+```
+We find the best round by finding the minimum of the mean error plus the mean error standard deviation. 
+By using this method it allows us to find optimal round before the model begins to overfit
+```{r eval=FALSE}
+set.seed(334)
+model5 <- xgb.train(params = param, data = dtrain, nrounds = 100)
+#prepare subtesting data for xgboost
+sparse_matrix_test = sparse.model.matrix(classe~.-1, data = subtesting)
+
+```
+Save all the prediction values and compare the accuracy of all the models
+```{r}
+model1_pred <- predict(model1, subtesting)
+model2_pred <- predict(model2, subtesting)
+model3_pred <- predict(model3, subtesting)
+model4_pred <- predict(model4, subtesting)
+
+model5_pred <- predict(model5, sparse_matrix_test, ntreelimit = bestround)
+#need to xgboost prediction back to classe labels
+classe <- as.factor(levels(subtraining$classe))
+model5_pred <- classe[model5_pred + 1]
+
+#compare accuracy of models
+(mod1_acc <- confusionMatrix(model1_pred, subtesting$classe)[[3]][1])
+(mod2_acc <- confusionMatrix(model2_pred, subtesting$classe)[[3]][1])
+(mod3_acc <- confusionMatrix(model3_pred, subtesting$classe)[[3]][1])
+(mod4_acc <- confusionMatrix(model4_pred, subtesting$classe)[[3]][1])
+(mod5_acc <- confusionMatrix(model5_pred, subtesting$classe)[[3]][1])
+
+```
+We find that models 1, 2, and 5 do reallly well. So we'll build a random forest model to combine these three models' predictions, 
+which we will then use to predict our test set. By combing the models we may be able to further improve the prediction.
+```{r eval=FALSE}
+predDF <- data.frame(model1_pred,model2_pred, model5_pred, classe = subtesting$classe)
+rfControl = trainControl(method = "repeatedcv", number = 5, repeats = 1)
+rfmodel <- train(classe ~ ., method = "rf", data = predDF, trControl = rfControl)
+comb_pred <- predict(rfmodel, predDF)
+```
+We can see below that the combination of the models further improved the accuracy. I would say the out of sample error would be less than 5%. 
+I did not perform validation on the combine data set since I didnt save enough data for this process, which is why I used a crossfold validation when I build the random forest model.
+```{r}
+rfmodel
+confusionMatrix(comb_pred, subtesting$classe)
+```
+Next we predict the subtesting set using each of the models then use those predictions as input to our random forest model.
+
+```{r}
+# make sure we have at least two levels for all fields
+levels(testing$new_window)<- c("no","yes")
+sparse_matrix_testing = sparse.model.matrix( ~ ., data = testing) 
+(model1_pred_test <- predict(model1, testing))
+(model2_pred_test <- predict(model2, testing))
+(model5_pred_test <- classe[predict(model5, sparse_matrix_testing) + 1])
+testDF <- data.frame(model1_pred = model1_pred_test, model2_pred = model2_pred_test, model5_pred = model5_pred_test, testing$problem_id)
+predict(rfmodel,newdata = testDF)
+```
+
+
